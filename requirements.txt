@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+supabase
+opencv-python-headless
+requests
+numpy
+python-multipart
+python-dotenv
+beautifulsoup4
