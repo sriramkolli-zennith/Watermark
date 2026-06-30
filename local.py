@@ -1,160 +1,206 @@
 import os
+import uuid
 import cv2
 import numpy as np
-import requests
+import httpx
 import glob
-from bs4 import BeautifulSoup
+import logging
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, HttpUrl, Field
 from supabase import Client, ClientOptions, create_client
 
-# 1. YOUR LOCAL DOCKER KEYS
-SUPABASE_URL = "http://127.0.0.1:54321"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU"
+# --- 1. CONFIGURATION & LOGGING ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("WatermarkScrubber")
 
-opts = ClientOptions(schema="core")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
+app = FastAPI(
+    title="Unified Watermark Scrubber API",
+    description="Enterprise-grade image sanitization microservice."
+)
 
-# 2. LOAD ALL LOGO TEMPLATES INTO THE ARSENAL
+# In production, pull these from an environment variable (e.g., "https://admin.yourdomain.com")
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS, 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ImagePayload(BaseModel):
+    source_url: HttpUrl = Field(..., description="The original Google Cloud Storage URL")
+
+# --- 2. SUPABASE INITIALIZATION ---
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "http://127.0.0.1:54321")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "your_local_key_here")
+
+try:
+    opts = ClientOptions(schema="core")
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
+    logger.info("Supabase client initialized successfully.")
+except Exception as e:
+    logger.error(f"Supabase client failed to initialize: {e}")
+
+# --- 3. TEMPLATE CACHING ---
 LOGO_DIR = "logos"
-LOGO_TEMPLATES = []
+# Store precomputed grayscale templates to save per-request CPU cycles
+LOGO_TEMPLATES_GRAY = []
 
-if os.path.exists(LOGO_DIR):
-    for ext in ("*.png", "*.jpg", "*.jpeg"):
-        for filepath in glob.glob(os.path.join(LOGO_DIR, ext)):
-            template = cv2.imread(filepath, cv2.IMREAD_COLOR)
-            if template is not None:
-                LOGO_TEMPLATES.append(template)
-            
-    if LOGO_TEMPLATES:
-        print(f"🎯 Bounty Hunter Active: Loaded {len(LOGO_TEMPLATES)} logo templates from '{LOGO_DIR}/'.")
+def load_templates():
+    global LOGO_TEMPLATES_GRAY
+    LOGO_TEMPLATES_GRAY.clear()
+    
+    if os.path.exists(LOGO_DIR):
+        for ext in ("*.png", "*.jpg", "*.jpeg"):
+            for filepath in glob.glob(os.path.join(LOGO_DIR, ext)):
+                template_bgr = cv2.imread(filepath, cv2.IMREAD_COLOR)
+                if template_bgr is not None:
+                    # Convert to grayscale immediately for robust edge/intensity matching
+                    template_gray = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2GRAY)
+                    LOGO_TEMPLATES_GRAY.append(template_gray)
+        logger.info(f"Loaded {len(LOGO_TEMPLATES_GRAY)} grayscale logo templates.")
     else:
-        print(f"⚠️ '{LOGO_DIR}/' exists but is empty. Faint watermark removal only.")
-else:
-    print(f"⚠️ '{LOGO_DIR}/' folder not found. Skipping moving logo removal. Faint watermark removal only.")
+        logger.warning(f"'{LOGO_DIR}/' folder not found. Logo erasure is disabled.")
 
+# Load templates on initial startup
+load_templates()
 
-def wash_html_block(raw_html: str, q_id: str, tag_type: str) -> tuple[str, int]:
-    if not raw_html or "storage.googleapis.com" not in raw_html:
-        return raw_html, 0
+@app.post("/reload-templates")
+async def reload_templates_endpoint():
+    """Hot-reload templates without restarting the server."""
+    load_templates()
+    return {"message": f"Reloaded {len(LOGO_TEMPLATES_GRAY)} templates."}
 
-    soup = BeautifulSoup(raw_html, "html.parser")
-    img_tags = soup.find_all("img")
-    washed_count = 0
+# --- 4. CORE SANITIZATION PIPELINE ---
+@app.post("/sanitize")
+async def sanitize_image(payload: ImagePayload):
+    fetch_url = str(payload.source_url)
+    
+    # Security: Limit image size to prevent memory exhaustion (e.g., 5MB)
+    MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024 
 
-    for idx, img in enumerate(img_tags):
-        old_src = img.get("src", "")
-
-        if "storage.googleapis.com" not in old_src:
-            continue
-
-        fetch_url = old_src if "http" in old_src else f"http:{old_src}"
-
-        try:
-            # 1. Download bytes to RAM
-            resp = requests.get(fetch_url, timeout=10)
+    try:
+        # A. Async Download (Non-blocking)
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(fetch_url, timeout=10.0)
             resp.raise_for_status()
+            
+            if len(resp.content) > MAX_IMAGE_SIZE_BYTES:
+                raise HTTPException(status_code=413, detail="Image size exceeds 5MB limit.")
 
-            bgr = cv2.imdecode(np.asarray(bytearray(resp.content), dtype="uint8"), cv2.IMREAD_COLOR)
+        # B. Decode to BGR Matrix
+        raw_array = np.asarray(bytearray(resp.content), dtype="uint8")
+        bgr = cv2.imdecode(raw_array, cv2.IMREAD_COLOR)
+        
+        if bgr is None:
+            raise HTTPException(status_code=400, detail="Could not decode image.")
 
-            # --- WEAPON 1: THE MULTI-SCALE BOUNTY HUNTER ---
-            if LOGO_TEMPLATES:
-                for t_idx, template in enumerate(LOGO_TEMPLATES):
-                    # Test 16 different sizes of your logo screenshot (from 50% to 200% size)
-                    for scale in np.linspace(0.5, 2.0, 16):
-                        try:
-                            # Resize the template for this iteration
-                            resized_template = cv2.resize(template, (0, 0), fx=scale, fy=scale)
-                            logo_h, logo_w = resized_template.shape[:2]
-                            img_h, img_w = bgr.shape[:2]
-                            
-                            # Skip if this specific scaled version is too big for the image
-                            if logo_h > img_h or logo_w > img_w:
-                                continue
-                            
-                            # Scan the image
-                            result = cv2.matchTemplate(bgr, resized_template, cv2.TM_CCOEFF_NORMED)
-                            
-                            # Aggressive threshold (0.60) to catch compressed JPEG logos
-                            locations = np.where(result >= 0.60)
-                            
-                            # Draw a pure white box over every match found
-                            for pt in zip(*locations[::-1]):
-                                cv2.rectangle(bgr, pt, (pt[0] + logo_w, pt[1] + logo_h), (255, 255, 255), -1)
+        img_h, img_w = bgr.shape[:2]
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        
+        logos_removed = 0
+        
+        # C. Weapon 1: Multi-Scale Grayscale Matching + Non-Maximum Suppression (NMS) + Inpainting
+        if LOGO_TEMPLATES_GRAY:
+            mask = np.zeros(gray.shape, dtype=np.uint8)
+            boxes = []
+            scores = []
+            
+            for template_gray in LOGO_TEMPLATES_GRAY:
+                # Test multiple scales
+                for scale in np.linspace(0.5, 2.0, 16):
+                    try:
+                        resized_t = cv2.resize(template_gray, (0, 0), fx=scale, fy=scale)
+                        r_h, r_w = resized_t.shape[:2]
                         
-                        except cv2.error:
-                            continue # Ignore any math errors during scaling and keep hunting
+                        if r_h > img_h or r_w > img_w:
+                            continue
+                        
+                        # Match on Grayscale (ignores color noise)
+                        result = cv2.matchTemplate(gray, resized_t, cv2.TM_CCOEFF_NORMED)
+                        threshold = 0.60
+                        locations = np.where(result >= threshold)
+                        
+                        for pt in zip(*locations[::-1]):
+                            boxes.append([int(pt[0]), int(pt[1]), int(r_w), int(r_h)])
+                            scores.append(float(result[pt[1], pt[0]]))
+                    except cv2.error:
+                        continue
+            
+            # Apply NMS to remove hundreds of overlapping duplicate boxes
+            if boxes:
+                indices = cv2.dnn.NMSBoxes(boxes, scores, score_threshold=0.60, nms_threshold=0.3)
+                if len(indices) > 0:
+                    for i in indices.flatten():
+                        x, y, w, h = boxes[i]
+                        # Draw filled rectangle on the MASK, not the image
+                        cv2.rectangle(mask, (x, y), (x + w, y + h), 255, -1)
+                        logos_removed += 1
+            
+            # Use Inpainting to seamlessly fill the masked area based on surrounding pixels
+            if logos_removed > 0:
+                bgr = cv2.inpaint(bgr, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+                # Re-calculate grayscale since we altered the BGR image
+                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
-            # --- WEAPON 2: THE HIGH JUMP (Faint Watermark Erasure) ---
-            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-            bgr[gray > 235] = 255
+        # D. Weapon 2: The High Jump (Faint Background Watermarks)
+        # Using a fixed luminance threshold for proven consistency with faint gray watermarks
+        bgr[gray > 235] = 255
 
-            # 2. Re-encode the pristine image
-            success, encoded_png = cv2.imencode(".png", bgr)
-            if not success:
-                print(f"   ❌ Failed to re-encode PNG: {fetch_url}")
-                continue
+        # E. Encode to PNG
+        success, encoded_png = cv2.imencode(".png", bgr)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to encode clean image.")
 
-            # 3. Specific destination inside bucket
-            file_path = f"diagrams/{q_id}_{tag_type}_{idx}.png"
+        # F. Upload to Supabase
+        unique_filename = f"live_upload_{uuid.uuid4().hex[:8]}.png"
+        file_path = f"diagrams/{unique_filename}"
 
-            supabase.storage.from_("sanitized-diagrams").upload(
-                path=file_path,
-                file=encoded_png.tobytes(),
-                file_options={"content-type": "image/png"},
-            )
+        upload_res = supabase.storage.from_("sanitized-diagrams").upload(
+            path=file_path,
+            file=encoded_png.tobytes(),
+            file_options={"content-type": "image/png"},
+        )
+        
+        # Validate Upload Success
+        if not upload_res or upload_res.status_code != 200:
+            logger.error(f"Supabase Upload Failed: {upload_res}")
+            raise HTTPException(status_code=502, detail="Failed to upload sanitized image to storage.")
 
-            # 4. Mutate HTML src attribute
-            new_url = f"{SUPABASE_URL}/storage/v1/object/public/sanitized-diagrams/{file_path}"
-            img["src"] = new_url
-            washed_count += 1
+        clean_url = f"{SUPABASE_URL}/storage/v1/object/public/sanitized-diagrams/{file_path}"
+        logger.info(f"Successfully sanitized and uploaded: {clean_url}")
+        
+        return {
+            "status": "success",
+            "clean_url": clean_url,
+            "metadata": {
+                "logos_removed": logos_removed,
+                "original_size": f"{img_w}x{img_h}"
+            }
+        }
 
-            label = "Question Prompt" if tag_type == "q" else "Solution Answer"
-            print(f"   [{label} Washed] Img #{idx+1} for ID: {q_id}")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP Error downloading image: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to fetch original image: {e.response.status_code}")
+    except httpx.RequestError as e:
+        logger.error(f"Network Error downloading image: {e}")
+        raise HTTPException(status_code=400, detail="Network error while fetching the image.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unexpected error during sanitization")
+        raise HTTPException(status_code=500, detail="Internal server error during image processing.")
 
-        except Exception as e:
-            print(f"   ❌ Failed on {fetch_url}: {e}")
-
-    return str(soup), washed_count
-
-
-def execute_total_omni_reset():
-    print("\n🚀 INITIATING SCALE-INVARIANT OMNI-SCRUBBER...")
-    print("Scanning EVERY row for Google links in Questions OR Solutions...\n")
-
-    response = (
-        supabase.table("question")
-        .select("id, question_text, solution_text")
-        .or_("question_text.ilike.%storage.googleapis.com%,solution_text.ilike.%storage.googleapis.com%")
-        .execute()
-    )
-
-    rows = response.data
-
-    if not rows:
-        print("⚠️ ZERO DIRTY ROWS FOUND!")
-        return
-
-    print(f"🎯 Found {len(rows)} infected rows. Commencing double-column scrub...\n")
-
-    total_q_washed, total_s_washed = 0, 0
-
-    for row in rows:
-        q_id = row["id"]
-        new_q_html, q_count = wash_html_block(row["question_text"], q_id, "q")
-        new_s_html, s_count = wash_html_block(row["solution_text"], q_id, "s")
-
-        if q_count > 0 or s_count > 0:
-            supabase.table("question").update(
-                {"question_text": new_q_html, "solution_text": new_s_html}
-            ).eq("id", q_id).execute()
-
-            total_q_washed += q_count
-            total_s_washed += s_count
-
-    print("\n" + "=" * 55)
-    print("🎉 MASTER MIGRATION COMPLETE!")
-    print(f"   • Question Prompts Sanitized: {total_q_washed} images")
-    print(f"   • Solution Answers Sanitized: {total_s_washed} images")
-    print("=" * 55)
-
-if __name__ == "__main__":
-    execute_total_omni_reset()
+@app.get("/")
+def health_check():
+    return {
+        "status": "Online",
+        "service": "Unified Watermark Scrubber API",
+        "templates_loaded": len(LOGO_TEMPLATES_GRAY)
+    }
