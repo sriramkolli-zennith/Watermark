@@ -65,19 +65,30 @@ def wash_html_block(raw_html: str, q_id: str, tag_type: str) -> tuple[str, int]:
             # --- WEAPON 1: THE BOUNTY HUNTER (Multi-Logo Erasure) ---
             # Do this BEFORE altering the brightness of the whole image
             if LOGO_TEMPLATES:
-                for template in LOGO_TEMPLATES:
+                for t_idx, template in enumerate(LOGO_TEMPLATES):
                     logo_h, logo_w = template.shape[:2]
+                    img_h, img_w = bgr.shape[:2]
                     
-                    # Scan the image for this specific logo variation
-                    result = cv2.matchTemplate(bgr, template, cv2.TM_CCOEFF_NORMED)
+                    # FIX 1: Prevent OpenCV crash if the downloaded image is smaller than the logo
+                    if logo_h > img_h or logo_w > img_w:
+                        print(f"   ⚠️ Skipping Logo #{t_idx+1} - Image ({img_w}x{img_h}) is smaller than Template ({logo_w}x{logo_h}).")
+                        continue
                     
-                    # 0.80 = "80% confidence match". Adjust if it's missing or over-erasing.
-                    threshold = 0.80 
-                    locations = np.where(result >= threshold)
+                    try:
+                        # Scan the image for this specific logo variation
+                        result = cv2.matchTemplate(bgr, template, cv2.TM_CCOEFF_NORMED)
+                        
+                        # 0.80 = "80% confidence match". Adjust if it's missing or over-erasing.
+                        threshold = 0.80 
+                        locations = np.where(result >= threshold)
+                        
+                        # Draw a pure white box over every match found
+                        for pt in zip(*locations[::-1]):
+                            cv2.rectangle(bgr, pt, (pt[0] + logo_w, pt[1] + logo_h), (255, 255, 255), -1)
                     
-                    # Draw a pure white box over every match found
-                    for pt in zip(*locations[::-1]):
-                        cv2.rectangle(bgr, pt, (pt[0] + logo_w, pt[1] + logo_h), (255, 255, 255), -1)
+                    except cv2.error as cv_err:
+                        print(f"   ❌ OpenCV matchTemplate crash bypassed on image {fetch_url}: {cv_err}")
+                        continue
 
             # --- WEAPON 2: THE HIGH JUMP (Faint Watermark Erasure) ---
             gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -92,8 +103,9 @@ def wash_html_block(raw_html: str, q_id: str, tag_type: str) -> tuple[str, int]:
             # 3. Specific destination inside bucket (e.g., diagrams/d0040105_q_0.png)
             file_path = f"diagrams/{q_id}_{tag_type}_{idx}.png"
 
+            # FIX 2: Changed 'file_path' to 'path' for your Supabase SDK version
             supabase.storage.from_("sanitized-diagrams").upload(
-                file_path=file_path,
+                path=file_path,
                 file=encoded_png.tobytes(),
                 file_options={"content-type": "image/png"},
             )
