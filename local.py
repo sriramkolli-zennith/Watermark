@@ -127,23 +127,10 @@ def wash_html_block(raw_html: str, q_id: str, tag_type: str) -> tuple[str, int]:
                         kernel = np.ones((3, 3), np.uint8)
                         precise_mask = cv2.dilate(precise_mask, kernel, iterations=1)
                         
-                        # 4. BORDER PROTECTION: Protect the photo's cyan frame!
-                        # If our patch touches the absolute edge of the image, clear the mask edges
-                        # so we don't accidentally inpaint the photo's beautiful cyan border.
-                        frame_thickness = 5
-                        if y1 == 0:
-                            precise_mask[0:frame_thickness, :] = 0  # Protect top border
-                        if x1 == 0:
-                            precise_mask[:, 0:frame_thickness] = 0  # Protect left border
-                        if y2 == img_h:
-                            precise_mask[-frame_thickness:, :] = 0  # Protect bottom border
-                        if x2 == img_w:
-                            precise_mask[:, -frame_thickness:] = 0  # Protect right border
-                        
                         # Apply this stroke-level tight mask to the global mask
                         mask[y1:y2, x1:x2] = precise_mask
                         logos_to_inpaint += 1
-                        logger.info(f"   [OCR Tracker] Found '{text}'. Photo detected -> Tight Pixel Mask applied with Border Protection.")
+                        logger.info(f"   [OCR Tracker] Found '{text}'. Photo detected -> Tight Pixel Mask applied.")
 
                     logos_removed += 1
                     break # Stop reading this image once the logo is handled
@@ -182,7 +169,7 @@ def wash_html_block(raw_html: str, q_id: str, tag_type: str) -> tuple[str, int]:
     return str(soup), washed_count
 
 def execute_total_omni_reset():
-    logger.info("🚀 INITIATING SMART OCR OMNI-SCRUBBER (HARD THRESHOLD & BORDER PROTECT)...")
+    logger.info("🚀 INITIATING SMART OCR OMNI-SCRUBBER (HARD THRESHOLD)...")
     logger.info("Scanning EVERY row for Google links in Questions OR Solutions...\n")
 
     response = (
