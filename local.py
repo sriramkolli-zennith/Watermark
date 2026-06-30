@@ -1,44 +1,18 @@
 import os
-import uuid
 import cv2
 import numpy as np
-import httpx
+import requests
 import logging
 import easyocr
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl, Field
+from bs4 import BeautifulSoup
 from supabase import Client, ClientOptions, create_client
 
-# --- 1. CONFIGURATION & LOGGING ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger("WatermarkScrubber")
+# --- 1. SETUP & LOGGING ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("OmniScrubber")
 
-app = FastAPI(
-    title="Unified Watermark Scrubber API",
-    description="Enterprise-grade image sanitization microservice."
-)
-
-# In production, pull these from an environment variable (e.g., "https://admin.yourdomain.com")
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS, 
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class ImagePayload(BaseModel):
-    source_url: HttpUrl = Field(..., description="The original Google Cloud Storage URL")
-
-# --- 2. SUPABASE INITIALIZATION ---
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "http://127.0.0.1:54321")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "your_local_key_here")
+SUPABASE_URL = "http://127.0.0.1:54321"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU"
 
 try:
     opts = ClientOptions(schema="core")
@@ -47,147 +21,173 @@ try:
 except Exception as e:
     logger.error(f"Supabase client failed to initialize: {e}")
 
-# --- 3. INITIALIZE EASYOCR ---
-logger.info("⏳ Initializing EasyOCR Models...")
+# --- 2. INITIALIZE EASYOCR ---
+logger.info("⏳ Initializing EasyOCR Models (This may take a moment...)")
 OCR_READER = easyocr.Reader(['en'], gpu=False)
 logger.info("✅ EasyOCR Ready!")
 
-# --- 4. CORE SANITIZATION PIPELINE ---
-@app.post("/sanitize")
-async def sanitize_image(payload: ImagePayload):
-    fetch_url = str(payload.source_url)
-    
-    # Security: Limit image size to prevent memory exhaustion (e.g., 5MB)
-    MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024 
 
-    try:
-        # A. Async Download (Non-blocking)
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(fetch_url, timeout=10.0)
+def wash_html_block(raw_html: str, q_id: str, tag_type: str) -> tuple[str, int]:
+    """Takes raw HTML, wipes faint watermarks, uses OCR to find logos, and intelligently erases them."""
+    if not raw_html or "storage.googleapis.com" not in raw_html:
+        return raw_html, 0
+
+    soup = BeautifulSoup(raw_html, "html.parser")
+    img_tags = soup.find_all("img")
+    washed_count = 0
+
+    for idx, img in enumerate(img_tags):
+        old_src = img.get("src", "")
+        if "storage.googleapis.com" not in old_src:
+            continue
+
+        fetch_url = old_src if "http" in old_src else f"http:{old_src}"
+
+        try:
+            # A. Download bytes to RAM
+            resp = requests.get(fetch_url, timeout=10)
             resp.raise_for_status()
+
+            bgr = cv2.imdecode(np.asarray(bytearray(resp.content), dtype="uint8"), cv2.IMREAD_COLOR)
+            if bgr is None:
+                continue
+
+            img_h, img_w = bgr.shape[:2]
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
             
-            if len(resp.content) > MAX_IMAGE_SIZE_BYTES:
-                raise HTTPException(status_code=413, detail="Image size exceeds 5MB limit.")
-
-        # B. Decode to BGR Matrix
-        raw_array = np.asarray(bytearray(resp.content), dtype="uint8")
-        bgr = cv2.imdecode(raw_array, cv2.IMREAD_COLOR)
-        
-        if bgr is None:
-            raise HTTPException(status_code=400, detail="Could not decode image.")
-
-        img_h, img_w = bgr.shape[:2]
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        
-        # Weapon 1: Global Faint Watermark Wipe
-        bgr[gray > 235] = 255
-        
-        clean_gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        mask = np.zeros(clean_gray.shape, dtype=np.uint8)
-        
-        logos_removed = 0
-        logos_to_inpaint = 0
-        
-        # Weapon 2: Full-Image EasyOCR Text Detection
-        ocr_results = OCR_READER.readtext(clean_gray)
-        
-        for (bbox, text, prob) in ocr_results:
-            clean_text = text.lower().replace(" ", "")
-            target_words = ["testbook", "tesibook", "testb", "estbook", "tbook"]
+            # =================================================================
+            # B. WEAPON 1: Global Faint Watermark Wipe
+            # =================================================================
+            bgr[gray > 235] = 255
             
-            if any(target in clean_text for target in target_words):
-                x_coords = [p[0] for p in bbox]
-                y_coords = [p[1] for p in bbox]
-                x_min, x_max = int(min(x_coords)), int(max(x_coords))
-                y_min, y_max = int(min(y_coords)), int(max(y_coords))
+            clean_gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            mask = np.zeros(clean_gray.shape, dtype=np.uint8)
+            
+            logos_removed = 0
+            logos_to_inpaint = 0
 
-                text_width = x_max - x_min
-                pad_left = int(text_width * 0.55) 
-                pad_right = 10
-                pad_y = 15
+            # =================================================================
+            # C. WEAPON 2: Full-Image EasyOCR Text Detection
+            # =================================================================
+            ocr_results = OCR_READER.readtext(clean_gray)
+            
+            for (bbox, text, prob) in ocr_results:
+                clean_text = text.lower().replace(" ", "")
+                target_words = ["testbook", "tesibook", "testb", "estbook", "tbook"]
                 
-                x1 = max(0, x_min - pad_left)
-                y1 = max(0, y_min - pad_y)
-                x2 = min(img_w, x_max + pad_right)
-                y2 = min(img_h, y_max + pad_y)
+                if any(target in clean_text for target in target_words):
+                    x_coords = [p[0] for p in bbox]
+                    y_coords = [p[1] for p in bbox]
+                    x_min, x_max = int(min(x_coords)), int(max(x_coords))
+                    y_min, y_max = int(min(y_coords)), int(max(y_coords))
 
-                # --- SMART CONTEXT-AWARE ERASURE ---
-                patch = clean_gray[y1:y2, x1:x2]
-                
-                if patch.shape[0] > 0 and patch.shape[1] > 0:
-                    # Look at the pixels forming the border around the logo
-                    top_edge = patch[0, :]
-                    bottom_edge = patch[-1, :]
-                    left_edge = patch[:, 0]
-                    right_edge = patch[:, -1]
-                    border_pixels = np.concatenate([top_edge, bottom_edge, left_edge, right_edge])
+                    # Expand the bounding box to the LEFT to swallow the blue book icon
+                    text_width = x_max - x_min
+                    pad_left = int(text_width * 0.55) 
+                    pad_right = 10
+                    pad_y = 15
                     
-                    # If the median color of the border is white/light, it's a diagram.
-                    if np.median(border_pixels) > 235:
-                        cv2.rectangle(bgr, (x1, y1), (x2, y2), (255, 255, 255), -1)
-                        logger.info(f"   [OCR Tracker] Found '{text}'. White background detected -> Solid White Box applied.")
-                    else:
-                        # Otherwise, it's a photograph (like the Cheetah). We need to blend it.
-                        cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
-                        logos_to_inpaint += 1
-                        logger.info(f"   [OCR Tracker] Found '{text}'. Photo background detected -> Inpainting applied.")
+                    x1 = max(0, x_min - pad_left)
+                    y1 = max(0, y_min - pad_y)
+                    x2 = min(img_w, x_max + pad_right)
+                    y2 = min(img_h, y_max + pad_y)
 
-                logos_removed += 1
-                break
-        
-        # Use Inpainting ONLY for photographic backgrounds
-        if logos_to_inpaint > 0:
-            radius = max(3, int(img_w * 0.01))
-            bgr = cv2.inpaint(bgr, mask, inpaintRadius=radius, flags=cv2.INPAINT_TELEA)
+                    # --- SMART CONTEXT-AWARE ERASURE ---
+                    patch = clean_gray[y1:y2, x1:x2]
+                    
+                    if patch.shape[0] > 0 and patch.shape[1] > 0:
+                        top_edge = patch[0, :]
+                        bottom_edge = patch[-1, :]
+                        left_edge = patch[:, 0]
+                        right_edge = patch[:, -1]
+                        border_pixels = np.concatenate([top_edge, bottom_edge, left_edge, right_edge])
+                        
+                        # Check median background color around the logo
+                        if np.median(border_pixels) > 235:
+                            # Diagram detected (White background): Solid White Box
+                            cv2.rectangle(bgr, (x1, y1), (x2, y2), (255, 255, 255), -1)
+                            logger.info(f"   [OCR Tracker] Found '{text}'. Diagram detected -> Solid White Box applied.")
+                        else:
+                            # Photograph detected: Add to mask for inpainting
+                            cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+                            logos_to_inpaint += 1
+                            logger.info(f"   [OCR Tracker] Found '{text}'. Photo detected -> Inpainting applied.")
 
-        # E. Encode to PNG
-        success, encoded_png = cv2.imencode(".png", bgr)
-        if not success:
-            raise HTTPException(status_code=500, detail="Failed to encode clean image.")
+                    logos_removed += 1
+                    break # Stop reading this image once the logo is handled
 
-        # F. Upload to Supabase
-        unique_filename = f"live_upload_{uuid.uuid4().hex[:8]}.png"
-        file_path = f"diagrams/{unique_filename}"
+            # =================================================================
+            # D. Inpainting (ONLY for photographic backgrounds)
+            # =================================================================
+            if logos_to_inpaint > 0:
+                radius = max(3, int(img_w * 0.01))
+                bgr = cv2.inpaint(bgr, mask, inpaintRadius=radius, flags=cv2.INPAINT_TELEA)
 
-        upload_res = supabase.storage.from_("sanitized-diagrams").upload(
-            path=file_path,
-            file=encoded_png.tobytes(),
-            file_options={"content-type": "image/png"},
-        )
-        
-        # Validate Upload Success
-        if not upload_res or upload_res.status_code != 200:
-            logger.error(f"Supabase Upload Failed: {upload_res}")
-            raise HTTPException(status_code=502, detail="Failed to upload sanitized image to storage.")
+            # E. Re-encode and Upload
+            success, encoded_png = cv2.imencode(".png", bgr)
+            if not success:
+                continue
 
-        clean_url = f"{SUPABASE_URL}/storage/v1/object/public/sanitized-diagrams/{file_path}"
-        logger.info(f"Successfully sanitized and uploaded: {clean_url}")
-        
-        return {
-            "status": "success",
-            "clean_url": clean_url,
-            "metadata": {
-                "logos_removed": logos_removed,
-                "original_size": f"{img_w}x{img_h}"
-            }
-        }
+            file_path = f"diagrams/{q_id}_{tag_type}_{idx}.png"
 
-    except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP Error downloading image: {e}")
-        raise HTTPException(status_code=400, detail=f"Failed to fetch original image: {e.response.status_code}")
-    except httpx.RequestError as e:
-        logger.error(f"Network Error downloading image: {e}")
-        raise HTTPException(status_code=400, detail="Network error while fetching the image.")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Unexpected error during sanitization")
-        raise HTTPException(status_code=500, detail="Internal server error during image processing.")
+            supabase.storage.from_("sanitized-diagrams").upload(
+                path=file_path,
+                file=encoded_png.tobytes(),
+                file_options={"content-type": "image/png"},
+            )
 
-@app.get("/")
-def health_check():
-    return {
-        "status": "Online",
-        "service": "Unified Watermark Scrubber API",
-        "ocr_engine": "Active"
-    }
+            new_url = f"{SUPABASE_URL}/storage/v1/object/public/sanitized-diagrams/{file_path}"
+            img["src"] = new_url
+            washed_count += 1
+            
+            label = "Question Prompt" if tag_type == "q" else "Solution Answer"
+            if logos_removed == 0:
+                logger.info(f"[{label} Washed] Img #{idx+1} for ID: {q_id} (Clean diagram, safely preserved)")
+
+        except Exception as e:
+            logger.error(f"Failed on {fetch_url}: {e}")
+
+    return str(soup), washed_count
+
+def execute_total_omni_reset():
+    logger.info("🚀 INITIATING SMART OCR OMNI-SCRUBBER...")
+    logger.info("Scanning EVERY row for Google links in Questions OR Solutions...\n")
+
+    response = (
+        supabase.table("question")
+        .select("id, question_text, solution_text")
+        .or_("question_text.ilike.%storage.googleapis.com%,solution_text.ilike.%storage.googleapis.com%")
+        .execute()
+    )
+
+    rows = response.data
+
+    if not rows:
+        logger.warning("⚠️ ZERO DIRTY ROWS FOUND! (Run 'npx supabase db reset' if testing)")
+        return
+
+    logger.info(f"🎯 Found {len(rows)} infected rows. Commencing double-column scrub...\n")
+
+    total_q_washed, total_s_washed = 0, 0
+
+    for row in rows:
+        q_id = row["id"]
+        new_q_html, q_count = wash_html_block(row["question_text"], q_id, "q")
+        new_s_html, s_count = wash_html_block(row["solution_text"], q_id, "s")
+
+        if q_count > 0 or s_count > 0:
+            supabase.table("question").update(
+                {"question_text": new_q_html, "solution_text": new_s_html}
+            ).eq("id", q_id).execute()
+
+            total_q_washed += q_count
+            total_s_washed += s_count
+
+    print("\n" + "=" * 55)
+    print("🎉 MASTER MIGRATION COMPLETE!")
+    print(f"   • Question Prompts Sanitized: {total_q_washed} images")
+    print(f"   • Solution Answers Sanitized: {total_s_washed} images")
+    print("=" * 55)
+
+if __name__ == "__main__":
+    execute_total_omni_reset()
