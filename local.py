@@ -3,8 +3,8 @@ import uuid
 import cv2
 import numpy as np
 import httpx
-import glob
 import logging
+import easyocr
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl, Field
@@ -47,35 +47,10 @@ try:
 except Exception as e:
     logger.error(f"Supabase client failed to initialize: {e}")
 
-# --- 3. TEMPLATE CACHING ---
-LOGO_DIR = "logos"
-# Store precomputed grayscale templates to save per-request CPU cycles
-LOGO_TEMPLATES_GRAY = []
-
-def load_templates():
-    global LOGO_TEMPLATES_GRAY
-    LOGO_TEMPLATES_GRAY.clear()
-    
-    if os.path.exists(LOGO_DIR):
-        for ext in ("*.png", "*.jpg", "*.jpeg"):
-            for filepath in glob.glob(os.path.join(LOGO_DIR, ext)):
-                template_bgr = cv2.imread(filepath, cv2.IMREAD_COLOR)
-                if template_bgr is not None:
-                    # Convert to grayscale immediately for robust edge/intensity matching
-                    template_gray = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2GRAY)
-                    LOGO_TEMPLATES_GRAY.append(template_gray)
-        logger.info(f"Loaded {len(LOGO_TEMPLATES_GRAY)} grayscale logo templates.")
-    else:
-        logger.warning(f"'{LOGO_DIR}/' folder not found. Logo erasure is disabled.")
-
-# Load templates on initial startup
-load_templates()
-
-@app.post("/reload-templates")
-async def reload_templates_endpoint():
-    """Hot-reload templates without restarting the server."""
-    load_templates()
-    return {"message": f"Reloaded {len(LOGO_TEMPLATES_GRAY)} templates."}
+# --- 3. INITIALIZE EASYOCR ---
+logger.info("⏳ Initializing EasyOCR Models...")
+OCR_READER = easyocr.Reader(['en'], gpu=False)
+logger.info("✅ EasyOCR Ready!")
 
 # --- 4. CORE SANITIZATION PIPELINE ---
 @app.post("/sanitize")
@@ -104,54 +79,66 @@ async def sanitize_image(payload: ImagePayload):
         img_h, img_w = bgr.shape[:2]
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         
-        logos_removed = 0
-        
-        # C. Weapon 1: Multi-Scale Grayscale Matching + Non-Maximum Suppression (NMS) + Inpainting
-        if LOGO_TEMPLATES_GRAY:
-            mask = np.zeros(gray.shape, dtype=np.uint8)
-            boxes = []
-            scores = []
-            
-            for template_gray in LOGO_TEMPLATES_GRAY:
-                # Test multiple scales
-                for scale in np.linspace(0.5, 2.0, 16):
-                    try:
-                        resized_t = cv2.resize(template_gray, (0, 0), fx=scale, fy=scale)
-                        r_h, r_w = resized_t.shape[:2]
-                        
-                        if r_h > img_h or r_w > img_w:
-                            continue
-                        
-                        # Match on Grayscale (ignores color noise)
-                        result = cv2.matchTemplate(gray, resized_t, cv2.TM_CCOEFF_NORMED)
-                        threshold = 0.60
-                        locations = np.where(result >= threshold)
-                        
-                        for pt in zip(*locations[::-1]):
-                            boxes.append([int(pt[0]), int(pt[1]), int(r_w), int(r_h)])
-                            scores.append(float(result[pt[1], pt[0]]))
-                    except cv2.error:
-                        continue
-            
-            # Apply NMS to remove hundreds of overlapping duplicate boxes
-            if boxes:
-                indices = cv2.dnn.NMSBoxes(boxes, scores, score_threshold=0.60, nms_threshold=0.3)
-                if len(indices) > 0:
-                    for i in indices.flatten():
-                        x, y, w, h = boxes[i]
-                        # Draw filled rectangle on the MASK, not the image
-                        cv2.rectangle(mask, (x, y), (x + w, y + h), 255, -1)
-                        logos_removed += 1
-            
-            # Use Inpainting to seamlessly fill the masked area based on surrounding pixels
-            if logos_removed > 0:
-                bgr = cv2.inpaint(bgr, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
-                # Re-calculate grayscale since we altered the BGR image
-                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-
-        # D. Weapon 2: The High Jump (Faint Background Watermarks)
-        # Using a fixed luminance threshold for proven consistency with faint gray watermarks
+        # Weapon 1: Global Faint Watermark Wipe
         bgr[gray > 235] = 255
+        
+        clean_gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        mask = np.zeros(clean_gray.shape, dtype=np.uint8)
+        
+        logos_removed = 0
+        logos_to_inpaint = 0
+        
+        # Weapon 2: Full-Image EasyOCR Text Detection
+        ocr_results = OCR_READER.readtext(clean_gray)
+        
+        for (bbox, text, prob) in ocr_results:
+            clean_text = text.lower().replace(" ", "")
+            target_words = ["testbook", "tesibook", "testb", "estbook", "tbook"]
+            
+            if any(target in clean_text for target in target_words):
+                x_coords = [p[0] for p in bbox]
+                y_coords = [p[1] for p in bbox]
+                x_min, x_max = int(min(x_coords)), int(max(x_coords))
+                y_min, y_max = int(min(y_coords)), int(max(y_coords))
+
+                text_width = x_max - x_min
+                pad_left = int(text_width * 0.55) 
+                pad_right = 10
+                pad_y = 15
+                
+                x1 = max(0, x_min - pad_left)
+                y1 = max(0, y_min - pad_y)
+                x2 = min(img_w, x_max + pad_right)
+                y2 = min(img_h, y_max + pad_y)
+
+                # --- SMART CONTEXT-AWARE ERASURE ---
+                patch = clean_gray[y1:y2, x1:x2]
+                
+                if patch.shape[0] > 0 and patch.shape[1] > 0:
+                    # Look at the pixels forming the border around the logo
+                    top_edge = patch[0, :]
+                    bottom_edge = patch[-1, :]
+                    left_edge = patch[:, 0]
+                    right_edge = patch[:, -1]
+                    border_pixels = np.concatenate([top_edge, bottom_edge, left_edge, right_edge])
+                    
+                    # If the median color of the border is white/light, it's a diagram.
+                    if np.median(border_pixels) > 235:
+                        cv2.rectangle(bgr, (x1, y1), (x2, y2), (255, 255, 255), -1)
+                        logger.info(f"   [OCR Tracker] Found '{text}'. White background detected -> Solid White Box applied.")
+                    else:
+                        # Otherwise, it's a photograph (like the Cheetah). We need to blend it.
+                        cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+                        logos_to_inpaint += 1
+                        logger.info(f"   [OCR Tracker] Found '{text}'. Photo background detected -> Inpainting applied.")
+
+                logos_removed += 1
+                break
+        
+        # Use Inpainting ONLY for photographic backgrounds
+        if logos_to_inpaint > 0:
+            radius = max(3, int(img_w * 0.01))
+            bgr = cv2.inpaint(bgr, mask, inpaintRadius=radius, flags=cv2.INPAINT_TELEA)
 
         # E. Encode to PNG
         success, encoded_png = cv2.imencode(".png", bgr)
@@ -202,5 +189,5 @@ def health_check():
     return {
         "status": "Online",
         "service": "Unified Watermark Scrubber API",
-        "templates_loaded": len(LOGO_TEMPLATES_GRAY)
+        "ocr_engine": "Active"
     }
