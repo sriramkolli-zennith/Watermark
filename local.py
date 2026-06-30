@@ -11,6 +11,7 @@ from supabase import Client, ClientOptions, create_client
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("OmniScrubber")
 
+# Replace with your actual local or production Supabase credentials
 SUPABASE_URL = "http://127.0.0.1:54321"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU"
 
@@ -23,12 +24,13 @@ except Exception as e:
 
 # --- 2. INITIALIZE EASYOCR ---
 logger.info("⏳ Initializing EasyOCR Models (This may take a moment...)")
+# gpu=False assumes running on standard CPU. Switch to True if running on a CUDA-enabled GPU.
 OCR_READER = easyocr.Reader(['en'], gpu=False)
 logger.info("✅ EasyOCR Ready!")
 
 
 def wash_html_block(raw_html: str, q_id: str, tag_type: str) -> tuple[str, int]:
-    """Takes raw HTML, wipes faint watermarks, uses OCR to find logos, and intelligently erases them."""
+    """Takes raw HTML, safely wipes faint watermarks, and uses OCR/Tight-Masking to erase logos."""
     if not raw_html or "storage.googleapis.com" not in raw_html:
         return raw_html, 0
 
@@ -53,23 +55,31 @@ def wash_html_block(raw_html: str, q_id: str, tag_type: str) -> tuple[str, int]:
                 continue
 
             img_h, img_w = bgr.shape[:2]
-            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            
+            # Keep a reference to the ORIGINAL grayscale
+            original_gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            mask = np.zeros(original_gray.shape, dtype=np.uint8)
+            
+            # Calculate what percentage of the ENTIRE image is bright/white
+            white_pixel_ratio = np.mean(original_gray > 230)
+            is_diagram = white_pixel_ratio > 0.40
             
             # =================================================================
-            # B. WEAPON 1: Global Faint Watermark Wipe
+            # B. Conditional Faint Watermark Wipe
             # =================================================================
-            bgr[gray > 235] = 255
-            
-            clean_gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-            mask = np.zeros(clean_gray.shape, dtype=np.uint8)
+            if is_diagram:
+                bgr[original_gray > 235] = 255
+                clean_gray_for_ocr = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            else:
+                clean_gray_for_ocr = original_gray.copy()
             
             logos_removed = 0
             logos_to_inpaint = 0
 
             # =================================================================
-            # C. WEAPON 2: Full-Image EasyOCR Text Detection
+            # C. Full-Image EasyOCR Text Detection
             # =================================================================
-            ocr_results = OCR_READER.readtext(clean_gray)
+            ocr_results = OCR_READER.readtext(clean_gray_for_ocr)
             
             for (bbox, text, prob) in ocr_results:
                 clean_text = text.lower().replace(" ", "")
@@ -93,25 +103,47 @@ def wash_html_block(raw_html: str, q_id: str, tag_type: str) -> tuple[str, int]:
                     y2 = min(img_h, y_max + pad_y)
 
                     # --- SMART CONTEXT-AWARE ERASURE ---
-                    patch = clean_gray[y1:y2, x1:x2]
-                    
-                    if patch.shape[0] > 0 and patch.shape[1] > 0:
-                        top_edge = patch[0, :]
-                        bottom_edge = patch[-1, :]
-                        left_edge = patch[:, 0]
-                        right_edge = patch[:, -1]
-                        border_pixels = np.concatenate([top_edge, bottom_edge, left_edge, right_edge])
+                    if is_diagram:
+                        # Diagram: Draw a pure solid white box. No distortion.
+                        cv2.rectangle(bgr, (x1, y1), (x2, y2), (255, 255, 255), -1)
+                        logger.info(f"   [OCR Tracker] Found '{text}'. Diagram detected -> Solid White Box applied.")
+                    else:
+                        # Photograph: Create a "Tight Pixel Mask"
+                        patch_bgr = bgr[y1:y2, x1:x2]
+                        patch_gray = original_gray[y1:y2, x1:x2]
                         
-                        # Check median background color around the logo
-                        if np.median(border_pixels) > 235:
-                            # Diagram detected (White background): Solid White Box
-                            cv2.rectangle(bgr, (x1, y1), (x2, y2), (255, 255, 255), -1)
-                            logger.info(f"   [OCR Tracker] Found '{text}'. Diagram detected -> Solid White Box applied.")
-                        else:
-                            # Photograph detected: Add to mask for inpainting
-                            cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
-                            logos_to_inpaint += 1
-                            logger.info(f"   [OCR Tracker] Found '{text}'. Photo detected -> Inpainting applied.")
+                        # 1. HARD THRESHOLD: Only isolate pixels that are very dark (near black text)
+                        # This perfectly ignores the mid-tone grass shadows that fooled adaptiveThreshold.
+                        _, thresh_mask = cv2.threshold(patch_gray, 90, 255, cv2.THRESH_BINARY_INV)
+                        
+                        # 2. Isolate the Cyan icon using HSV color range
+                        hsv_patch = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2HSV)
+                        lower_cyan = np.array([70, 40, 40])
+                        upper_cyan = np.array([120, 255, 255])
+                        cyan_mask = cv2.inRange(hsv_patch, lower_cyan, upper_cyan)
+                        
+                        # 3. Combine both masks and dilate slightly to cover anti-aliased edges
+                        precise_mask = cv2.bitwise_or(thresh_mask, cyan_mask)
+                        kernel = np.ones((3, 3), np.uint8)
+                        precise_mask = cv2.dilate(precise_mask, kernel, iterations=1)
+                        
+                        # 4. BORDER PROTECTION: Protect the photo's cyan frame!
+                        # If our patch touches the absolute edge of the image, clear the mask edges
+                        # so we don't accidentally inpaint the photo's beautiful cyan border.
+                        frame_thickness = 5
+                        if y1 == 0:
+                            precise_mask[0:frame_thickness, :] = 0  # Protect top border
+                        if x1 == 0:
+                            precise_mask[:, 0:frame_thickness] = 0  # Protect left border
+                        if y2 == img_h:
+                            precise_mask[-frame_thickness:, :] = 0  # Protect bottom border
+                        if x2 == img_w:
+                            precise_mask[:, -frame_thickness:] = 0  # Protect right border
+                        
+                        # Apply this stroke-level tight mask to the global mask
+                        mask[y1:y2, x1:x2] = precise_mask
+                        logos_to_inpaint += 1
+                        logger.info(f"   [OCR Tracker] Found '{text}'. Photo detected -> Tight Pixel Mask applied with Border Protection.")
 
                     logos_removed += 1
                     break # Stop reading this image once the logo is handled
@@ -120,8 +152,8 @@ def wash_html_block(raw_html: str, q_id: str, tag_type: str) -> tuple[str, int]:
             # D. Inpainting (ONLY for photographic backgrounds)
             # =================================================================
             if logos_to_inpaint > 0:
-                radius = max(3, int(img_w * 0.01))
-                bgr = cv2.inpaint(bgr, mask, inpaintRadius=radius, flags=cv2.INPAINT_TELEA)
+                # Use a tiny radius to only pull from the immediate healthy grass pixels
+                bgr = cv2.inpaint(bgr, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
 
             # E. Re-encode and Upload
             success, encoded_png = cv2.imencode(".png", bgr)
@@ -142,7 +174,7 @@ def wash_html_block(raw_html: str, q_id: str, tag_type: str) -> tuple[str, int]:
             
             label = "Question Prompt" if tag_type == "q" else "Solution Answer"
             if logos_removed == 0:
-                logger.info(f"[{label} Washed] Img #{idx+1} for ID: {q_id} (Clean diagram, safely preserved)")
+                logger.info(f"[{label} Washed] Img #{idx+1} for ID: {q_id} (Cleaned gracefully)")
 
         except Exception as e:
             logger.error(f"Failed on {fetch_url}: {e}")
@@ -150,7 +182,7 @@ def wash_html_block(raw_html: str, q_id: str, tag_type: str) -> tuple[str, int]:
     return str(soup), washed_count
 
 def execute_total_omni_reset():
-    logger.info("🚀 INITIATING SMART OCR OMNI-SCRUBBER...")
+    logger.info("🚀 INITIATING SMART OCR OMNI-SCRUBBER (HARD THRESHOLD & BORDER PROTECT)...")
     logger.info("Scanning EVERY row for Google links in Questions OR Solutions...\n")
 
     response = (
